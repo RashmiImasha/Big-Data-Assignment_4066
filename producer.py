@@ -2,9 +2,7 @@ from confluent_kafka import Producer
 from confluent_kafka.serialization import SerializationContext, MessageField
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
-import random
-import time
-import json
+import random, time, json
 
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = 'localhost:9092'

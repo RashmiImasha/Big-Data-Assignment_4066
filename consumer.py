@@ -2,33 +2,29 @@ from confluent_kafka import Consumer, Producer, KafkaError
 from confluent_kafka.serialization import SerializationContext, MessageField
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
-import json
-import time
+import json, time, traceback, random
 from collections import deque
 
-# Configuration
+# Kafka Configuration
 KAFKA_BOOTSTRAP_SERVERS = 'localhost:9092'
 SCHEMA_REGISTRY_URL = 'http://localhost:8081'
 TOPIC = 'orders'
 DLQ_TOPIC = 'orders-dlq'
 RETRY_TOPIC = 'orders-retry'
 
-# Load Avro schema
+# Avro Schema Loading
 with open('schemas/order.avsc', 'r') as f:
     schema_str = f.read()
 
-# Schema Registry client
-schema_registry_conf = {'url': SCHEMA_REGISTRY_URL}
-schema_registry_client = SchemaRegistryClient(schema_registry_conf)
+schema_registry_client = SchemaRegistryClient({'url': SCHEMA_REGISTRY_URL})
 
-# Avro deserializer
 avro_deserializer = AvroDeserializer(
     schema_registry_client,
     schema_str,
     lambda order, ctx: order
 )
 
-# Consumer configuration
+# Consumer Configuration
 consumer_conf = {
     'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
     'group.id': 'order-consumer-group',
@@ -39,152 +35,163 @@ consumer_conf = {
 consumer = Consumer(consumer_conf)
 consumer.subscribe([TOPIC, RETRY_TOPIC])
 
-# DLQ Producer
-dlq_producer_conf = {'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS}
-dlq_producer = Producer(dlq_producer_conf)
+# Force DLQ for these orders
+ALWAYS_FAIL = {"12", "20", "32"}
 
-# Retry Producer
-retry_producer = Producer(dlq_producer_conf)
+# Producers
+dlq_producer = Producer({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
+retry_producer = Producer({'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS})
 
-# Price aggregation
+# Aggregation Variables
 price_sum = 0.0
 order_count = 0
-price_history = deque(maxlen=100)  # Keep last 100 prices
+price_history = deque(maxlen=100)
 
-# Retry tracking
 retry_counts = {}
 MAX_RETRIES = 3
 
+# Helper Functions
 def calculate_running_average():
-    """Calculate running average of prices"""
     if order_count == 0:
         return 0.0
     return price_sum / order_count
 
+
 def process_order(order):
-    """Process an order - simulates business logic with potential failures"""
+    """Main business logic"""
+
     order_id = order['orderId']
-    
-    # Simulate random failures (10% chance)
+
+    # Force DLQ for specific orders
+    if order_id in ALWAYS_FAIL:
+        raise Exception(f"Forced permanent failure for DLQ test (Order {order_id})")
+
+    # Temporary random failures (10%)
     if random.random() < 0.1:
         raise Exception(f"Temporary processing failure for order {order_id}")
-    
-    # Update aggregation
+
     global price_sum, order_count
     price = order['price']
+
     price_sum += price
     order_count += 1
     price_history.append(price)
-    
-    running_avg = calculate_running_average()
-    
-    print(f"\n✓ Processed Order: {order_id} | Product: {order['product']} | Price: ${price:.2f}")
-    print(f"  Running Average: ${running_avg:.2f} | Total Orders: {order_count}")
-    
-    return True
 
-def send_to_dlq(order, error_message):
-    """Send failed message to Dead Letter Queue"""
+    running_avg = calculate_running_average()
+
+    print(f"\nProcessed Order: {order_id} | Product: {order['product']} | Price: ${price:.2f}")
+    print(f"  Running Average: ${running_avg:.2f} | Total Orders: {order_count}")
+
+
+def send_to_dlq(order, error_message, stack_trace=None):
+    """Send failed message to DLQ as JSON"""
+
     dlq_message = {
-        'original_order': order,
-        'error': error_message,
-        'timestamp': time.time()
+        "failedOrder": order,
+        "errorMessage": error_message,
+        "stackTrace": stack_trace,
+        "originalTopic": TOPIC,
+        "timestamp": int(time.time())
     }
-    
+
     dlq_producer.produce(
         topic=DLQ_TOPIC,
         value=json.dumps(dlq_message).encode('utf-8')
     )
+
     dlq_producer.flush()
-    print(f"✗ Sent to DLQ: Order {order['orderId']} - {error_message}")
+
+    print(f"Sent to DLQ: Order {order.get('orderId', 'UNKNOWN')} - {error_message}")
+
 
 def send_to_retry(order):
-    """Send message to retry topic"""
     retry_producer.produce(
         topic=RETRY_TOPIC,
         value=json.dumps(order).encode('utf-8')
     )
     retry_producer.flush()
-    print(f"↻ Sent to Retry: Order {order['orderId']}")
+    print(f"Sent to Retry: Order {order['orderId']}")
 
+
+# Main Consumer Loop
 def consume_orders():
-    """Main consumer loop with retry logic"""
     print("Starting consumer with real-time aggregation...")
     print("=" * 60)
-    
+
     try:
         while True:
             msg = consumer.poll(timeout=1.0)
-            
             if msg is None:
                 continue
-            
+
             if msg.error():
                 if msg.error().code() == KafkaError._PARTITION_EOF:
                     continue
-                else:
-                    print(f"Consumer error: {msg.error()}")
-                    continue
-            
+                print(f"Consumer error: {msg.error()}")
+                continue
+
             try:
-                # Deserialize message
+                # Deserialization handling
                 if msg.topic() == TOPIC:
                     order = avro_deserializer(
                         msg.value(),
                         SerializationContext(TOPIC, MessageField.VALUE)
                     )
-                else:  # RETRY_TOPIC
+                else:
                     order = json.loads(msg.value().decode('utf-8'))
-                
+
                 order_id = order['orderId']
-                
-                # Track retry attempts
+
                 if order_id not in retry_counts:
                     retry_counts[order_id] = 0
-                
+
+                # Processing logic
                 try:
-                    # Process the order
                     process_order(order)
-                    
-                    # Success - commit offset
                     consumer.commit(msg)
-                    
-                    # Reset retry count on success
+
                     if order_id in retry_counts:
                         del retry_counts[order_id]
-                    
+
                 except Exception as e:
-                    # Processing failed - implement retry logic
                     retry_counts[order_id] += 1
-                    
+
                     if retry_counts[order_id] < MAX_RETRIES:
-                        print(f"⚠ Processing failed (attempt {retry_counts[order_id]}/{MAX_RETRIES}): {e}")
+                        print(f"Processing failed (attempt {retry_counts[order_id]}/{MAX_RETRIES}): {e}")
                         send_to_retry(order)
                         consumer.commit(msg)
-                        time.sleep(2)  # Backoff before retry
+                        time.sleep(1)
+
                     else:
-                        # Max retries exceeded - send to DLQ
-                        send_to_dlq(order, f"Max retries exceeded: {str(e)}")
+                        send_to_dlq(
+                            order,
+                            f"Max retries exceeded: {str(e)}",
+                            traceback.format_exc()
+                        )
                         consumer.commit(msg)
                         del retry_counts[order_id]
-                
+
             except Exception as e:
                 print(f"Error deserializing message: {e}")
-                # Send unparseable messages directly to DLQ
-                send_to_dlq({'raw_message': 'unparseable'}, str(e))
+
+                send_to_dlq(
+                    {"rawMessage": msg.value().decode('utf-8') if msg.value() else None},
+                    "Deserialization Failed",
+                    traceback.format_exc()
+                )
+
                 consumer.commit(msg)
-    
+
     except KeyboardInterrupt:
-        print("\n\nShutting down consumer...")
-        print(f"Final Statistics:")
-        print(f"  Total Orders Processed: {order_count}")
-        print(f"  Final Running Average: ${calculate_running_average():.2f}")
-    
+        print("\nStopping consumer...")
+        print(f"Total Orders Processed: {order_count}")
+        print(f"Final Running Average: ${calculate_running_average():.2f}")
+
     finally:
         consumer.close()
         dlq_producer.flush()
         retry_producer.flush()
 
+
 if __name__ == '__main__':
-    import random
     consume_orders()
